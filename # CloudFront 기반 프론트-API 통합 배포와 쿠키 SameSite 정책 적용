@@ -1,0 +1,65 @@
+# CloudFront 기반 프론트-API 통합 배포와 쿠키 SameSite 정책 적용
+
+## 1. 배경 — 왜 이 작업이 필요했는가
+
+쿠키 옵션(SameSite/Secure)을 확정하려면 먼저 프론트 인프라 구조가 정해져야 했다.
+
+- `SameSite`는 다른 사이트로 요청을 보낼 때 로그인 쿠키가 무단으로 실려가는 걸 막아 CSRF 같은 공격을 방지하기 위해 쓰는 쿠키 옵션이다.
+- HTTP 요청을 **누가(어느 사이트가) 만들었는지**와 **요청이 어디로 가는지**를 비교해서, 같으면 same-site, 다르면 cross-site로 판단한다.
+
+원래는 프론트 도메인(CloudFront)과 API(EC2)의 주소가 서로 달랐다. 그래서 cross-site 상황이었고, 다음과 같은 단점이 있었다.
+
+1. `SameSite=None` + `Secure` 필수 → EC2도 자체 HTTPS가 있어야 함 → 인증서·도메인 비용 발생 가능성
+2. CORS 설정이 훨씬 까다로워짐
+
+## 2. 해결 방향
+
+CloudFront에 API, 정적 파일 두 가지 경로(behavior)를 두면, 클라이언트가 요청을 보낼 때 브라우저 기준으로 same-site가 되기 때문에 위 문제가 해소된다.
+
+- **무료**: EC2 자체 HTTPS 인증서, 커스텀 도메인 구매 불필요
+- **깔끔한 구조**: origin 접근을 CloudFront로만 제한 가능
+- **CORS 설정 필요 없음**: 브라우저 기준 동일 origin으로 취급됨
+
+## 3. 인프라 구성 요약
+
+**작업 내용**
+
+- S3 범용 버킷 생성 + CloudFront 배포 생성
+- S3 접근 제어: OAC(Origin Access Control) 적용 — CloudFront만 S3에 접근 가능하도록 IAM 정책 기반으로 통제 (S3는 퍼블릭 차단 상태 유지)
+- WAS(EC2) 연동: CloudFront에 EC2를 두 번째 origin으로 추가, `/api/*` 경로는 EC2로 라우팅되도록 behavior 설정
+- 통신 구간: CloudFront ↔ EC2 구간은 HTTP (내부 구간이라 무료·비암호화 허용), 브라우저 ↔ CloudFront 구간은 여전히 HTTPS (사용자에게 실제로 노출되는 구간은 암호화 유지)
+- 브라우저 기준으로 프론트/API가 같은 CloudFront 도메인으로 보이므로 same-site → 쿠키 `SameSite=Lax`로 안전하게 동작
+
+## 4. 요청 흐름 예시
+
+### ① GET 요청 — 정적 파일 (React 화면 로딩)
+
+```
+브라우저 → https://d123abc.cloudfront.net/ (HTTPS)
+   ↓
+CloudFront: 경로가 기본값(*)이므로 S3 behavior 매칭
+   ↓
+CloudFront → S3 (OAC 서명 포함, HTTPS)
+   ↓
+S3: OAC 서명 검증 후 정적 파일(index.html, JS 등) 반환
+   ↓
+CloudFront → 브라우저로 응답 (필요 시 캐싱됨)
+```
+
+### ② POST 요청 — 로그인 API
+
+```
+브라우저 → https://d123abc.cloudfront.net/api/login (HTTPS, body에 로그인 정보)
+   ↓
+CloudFront: 경로가 /api/* 이므로 EC2 behavior 매칭
+   ↓
+CloudFront → EC2:80 (HTTP, 내부 구간, 보안그룹은 CloudFront IP 대역만 허용)
+   ↓
+EC2(Spring Boot): 로그인 처리 후 Set-Cookie 포함해 응답
+   ↓
+CloudFront → 브라우저로 응답 전달 (캐싱 안 함, CachingDisabled)
+   ↓
+브라우저: 쿠키 저장 (SameSite=Lax, Secure — 이후 요청부터 자동 첨부)
+```
+
+**핵심 차이**: 같은 CloudFront 도메인으로 요청이 들어오지만, 경로(`/` vs `/api/*`)에 따라 CloudFront가 내부적으로 S3 또는 EC2 중 어디로 보낼지 자동 분기한다. 브라우저 입장에서는 하나의 origin에 요청하는 것처럼 보이기 때문에 CORS나 cross-site 쿠키 문제 없이 동작한다.
